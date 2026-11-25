@@ -2,6 +2,7 @@ package tracing
 
 import (
 	"context"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -10,9 +11,12 @@ import (
 	"github.com/bytedance/sonic"
 	bifrost "github.com/maximhq/bifrost/core"
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/maximhq/bifrost/core/streamusage"
 	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
 	"github.com/maximhq/bifrost/framework/grant"
 	"github.com/maximhq/bifrost/framework/modelcatalog"
+	"github.com/maximhq/bifrost/framework/modelcatalog/datasheet"
+	"github.com/maximhq/bifrost/framework/modelcatalog/datasheet/datasheettest"
 	"github.com/stretchr/testify/require"
 )
 
@@ -1247,7 +1251,7 @@ func TestPopulateLLMResponseAttributes_ErrorPathHonorsIgnoreProviderCost(t *test
 		{name: "provider cost ignored", ignore: true, wantCost: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			catalog := modelcatalog.NewTestCatalog(nil)
+			catalog := catalogForTest(t, nil)
 			catalog.SetIgnoreProviderCost("cortecs", tc.ignore)
 			tracer := NewTracer(NewTraceStore(time.Hour, nil), catalog, nil)
 
@@ -1330,7 +1334,7 @@ func TestProcessStreamingChunk_HonorsIgnoreProviderCost(t *testing.T) {
 		{name: "provider cost ignored", ignore: true, wantCost: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			catalog := modelcatalog.NewTestCatalog(nil)
+			catalog := catalogForTest(t, nil)
 			catalog.SetIgnoreProviderCost("cortecs", tc.ignore)
 			tracer := NewTracer(NewTraceStore(time.Hour, nil), catalog, bifrost.NewNoOpLogger())
 
@@ -1373,7 +1377,7 @@ func TestProcessStreamingChunk_PricesWithRequestUserScope(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			catalog := modelcatalog.NewTestCatalog(nil)
+			catalog := catalogForTest(t, nil)
 			catalog.SetIgnoreProviderCost("cortecs", true)
 			uid := userID
 			require.NoError(t, catalog.SetPricingOverrides([]configstoreTables.TablePricingOverride{{
@@ -1402,7 +1406,7 @@ func TestProcessStreamingChunk_PricesWithRequestUserScope(t *testing.T) {
 // stream finishes, so an off-peak request keeps its discount however late its
 // final chunk lands.
 func TestProcessStreamingChunk_PricesAtRequestStartTime(t *testing.T) {
-	catalog := modelcatalog.NewTestCatalog(nil)
+	catalog := catalogForTest(t, nil)
 	catalog.SetIgnoreProviderCost("cortecs", true)
 	providerID := "cortecs"
 	// Peak covers every day except the 6-hour gap from 00:00 to 06:00 UTC, so
@@ -1602,3 +1606,97 @@ func TestTracer_StampsTimeToFirstTokenFromRequestReceipt(t *testing.T) {
 		t.Errorf("%s moved from %v to %v on a later chunk", schemas.AttrBifrostTimeToFirstTokenMs, before, after)
 	}
 }
+
+// A cancelled stream's usage is estimated from the same accumulator the logging
+// plugin feeds, read mid-stream before the accumulator is finalized.
+func TestTracer_CancelledStreamEstimatedFromAccumulator(t *testing.T) {
+	store := NewTraceStore(5*time.Minute, nil)
+	defer store.Stop()
+	tracer := NewTracer(store, nil, bifrost.NewNoOpLogger())
+	defer tracer.Stop()
+
+	const traceID = "trace-cancelled-estimate"
+	tracer.CreateStreamAccumulator(traceID, time.Now())
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyTracer, tracer)
+	ctx.SetValue(schemas.BifrostContextKeyTraceID, traceID)
+	for i, text := range []string{"hello ", "world"} {
+		chunk := &schemas.BifrostResponse{ChatResponse: &schemas.BifrostChatResponse{
+			Choices: []schemas.BifrostResponseChoice{{ChatStreamResponseChoice: &schemas.ChatStreamResponseChoice{Delta: &schemas.ChatStreamResponseChoiceDelta{Content: schemas.Ptr(text)}}}},
+		}}
+		chunk.PopulateExtraFields(schemas.ChatCompletionStreamRequest, schemas.OpenAI, "gpt-4o", "gpt-4o")
+		chunk.ChatResponse.ExtraFields.ChunkIndex = i
+		tracer.ProcessStreamingChunk(ctx, traceID, false, chunk, nil)
+	}
+
+	request := &schemas.BifrostRequest{RequestType: schemas.ChatCompletionStreamRequest, ChatRequest: &schemas.BifrostChatRequest{
+		Model: "gpt-4o", Input: []schemas.ChatMessage{{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("hi")}}},
+	}}
+	cancelled := &schemas.BifrostError{Error: &schemas.ErrorField{Type: schemas.Ptr(schemas.RequestCancelled)}}
+	streamusage.Estimate(ctx, request, "gpt-4o", cancelled)
+
+	usage := cancelled.ExtraFields.BilledUsage
+	require.NotNil(t, usage, "no usage estimated from the accumulated output")
+	require.Equal(t, 2, usage.CompletionTokens)
+	require.Equal(t, 8, usage.PromptTokens)
+	require.NotNil(t, usage.Estimation)
+	require.Equal(t, "o200k_base", usage.Estimation.Tokenizer)
+}
+
+// The span of a cancelled stream carries the cost of its estimated usage, priced
+// by the framework at the same catalog rates as reported usage.
+func TestPopulateLLMResponseAttributes_PricesEstimatedCancelledUsage(t *testing.T) {
+	abs, err := filepath.Abs("../modelcatalog/datasheet/testdata/pricing.json")
+	require.NoError(t, err)
+	ds := datasheetForTest(t, nil, bifrost.NewNoOpLogger(), datasheet.Config{URL: "file://" + abs})
+	require.NoError(t, ds.LoadFromURLIntoMemory(context.Background()))
+	tracer := NewTracer(NewTraceStore(time.Hour, nil), catalogWithDatasheetForTest(t, ds), bifrost.NewNoOpLogger())
+	defer tracer.Stop()
+
+	_, ctx := newHandleTestCtx(tracer)
+	_, handle := tracer.StartSpanID(ctx, "llm", schemas.SpanKindLLMCall)
+	span := tracer.SpanFromHandle(handle)
+	require.NotNil(t, span)
+	span.LLM = &schemas.LLMSpanData{RequestType: schemas.ChatCompletionStreamRequest}
+
+	cancelled := &schemas.BifrostError{Error: &schemas.ErrorField{Type: schemas.Ptr(schemas.RequestCancelled)}}
+	cancelled.PopulateExtraFields(schemas.ChatCompletionStreamRequest, schemas.OpenAI, "gpt-4o", "gpt-4o")
+	cancelled.ExtraFields.BilledUsage = &schemas.BifrostLLMUsage{
+		PromptTokens: 120, CompletionTokens: 40, TotalTokens: 160,
+		Estimation: &schemas.TokenUsageEstimation{Prompt: true, Completion: true, Tokenizer: "o200k_base"},
+	}
+
+	tracer.PopulateLLMResponseAttributes(schemas.NewBifrostContext(ctx, time.Now()), handle, nil, cancelled)
+
+	got, ok := span.GetAttribute(schemas.AttrUsageCost)
+	require.True(t, ok, "no cost recorded for the estimated usage")
+	// gpt-4o testdata: 2.5e-6 input, 1e-5 output.
+	require.InDelta(t, float64(120)*2.5e-6+float64(40)*1e-5, got, 1e-12)
+}
+
+// catalogForTest returns a test model catalog that is cleaned up when the test
+// ends, failing the test if it cannot be built.
+func catalogForTest(t testing.TB, baseModelIndex map[string]string) *modelcatalog.ModelCatalog {
+	t.Helper()
+	catalog, err := modelcatalog.NewTestCatalog(baseModelIndex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = catalog.Cleanup() })
+	return catalog
+}
+
+// catalogWithDatasheetForTest returns a test model catalog over ds that is
+// cleaned up when the test ends, failing the test if it cannot be built.
+func catalogWithDatasheetForTest(t testing.TB, ds *datasheet.Store) *modelcatalog.ModelCatalog {
+	t.Helper()
+	catalog, err := modelcatalog.NewTestCatalogWithDatasheet(ds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = catalog.Cleanup() })
+	return catalog
+}
+
+// datasheetForTest returns a datasheet over a new live store closed when the test ends.
+var datasheetForTest = datasheettest.New

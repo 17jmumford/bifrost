@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/fasthttp/router"
 	"github.com/google/uuid"
@@ -17,9 +18,12 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
-// PromptCacheReloader refreshes the in-memory prompt cache after a repository mutation.
+// PromptCacheReloader keeps memory in step with prompt repository writes.
 type PromptCacheReloader interface {
-	ReloadPromptCache(ctx context.Context) error
+	// RefreshPrompts brings the named prompts, with their versions, into memory after a write, or
+	// drops them when removed is set, and tells listeners the repository changed. With no IDs it
+	// refreshes nothing: a session write changes nothing memory holds.
+	RefreshPrompts(ctx context.Context, promptIDs []string, removed bool) error
 }
 
 // PromptsHandler handles prompt repository endpoints
@@ -28,24 +32,26 @@ type PromptsHandler struct {
 	reloader PromptCacheReloader // optional; nil when the prompts plugin is not loaded
 }
 
-// NewPromptsHandler creates a new PromptsHandler.
+// NewPromptsHandler creates a new PromptsHandler. store is nil when the config store is
+// disabled; the routes then answer 503 from RequireConfigStoreMiddleware.
 // reloader may be nil; when set, the in-memory prompt cache is refreshed after mutations.
 func NewPromptsHandler(store configstore.ConfigStore, reloader PromptCacheReloader) *PromptsHandler {
-	if store == nil {
-		return nil
-	}
 	return &PromptsHandler{store: store, reloader: reloader}
 }
 
-// reloadCache triggers a cache refresh if a reloader is configured.
-// Errors are logged but do not fail the originating request.
-func (h *PromptsHandler) reloadCache(ctx context.Context) {
+// refreshPrompts brings the prompts a write changed into memory, or drops them when removed is set.
+// A failure is logged and answered 500, naming what was written, and false is returned so the
+// caller stops there: the write stands, but memory still holds the previous prompts.
+func (h *PromptsHandler) refreshPrompts(ctx *fasthttp.RequestCtx, subject, action string, promptIDs []string, removed bool) bool {
 	if h.reloader == nil {
-		return
+		return true
 	}
-	if err := h.reloader.ReloadPromptCache(ctx); err != nil {
-		logger.Error("failed to reload prompt cache: %v", err)
+	if err := h.reloader.RefreshPrompts(ctx, promptIDs, removed); err != nil {
+		logger.Error("failed to reload %s after it was %s: %v", strings.ToLower(subject), action, err)
+		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("%s %s in database but failed to reload in-memory state", subject, action))
+		return false
 	}
+	return true
 }
 
 // RegisterRoutes registers the routes for the PromptsHandler
@@ -314,9 +320,26 @@ func (h *PromptsHandler) deleteFolder(ctx *fasthttp.RequestCtx) {
 	}
 
 	existing, _ := h.store.GetFolderByID(ctx, id)
+	// The delete takes the folder's prompts with it, so they are listed first to be dropped after.
+	var promptIDs []string
+	if h.reloader != nil {
+		prompts, err := h.store.GetPrompts(ctx, &id)
+		if err != nil {
+			logger.Error("failed to list the prompts of folder %s: %v", id, err)
+			SendError(ctx, fasthttp.StatusInternalServerError, "failed to list the folder's prompts")
+			return
+		}
+		for i := range prompts {
+			promptIDs = append(promptIDs, prompts[i].ID)
+		}
+	}
 	if err := h.store.DeleteFolder(ctx, id); err != nil {
 		if errors.Is(err, configstore.ErrNotFound) {
 			SendError(ctx, fasthttp.StatusNotFound, "folder not found")
+			return
+		}
+		if errors.Is(err, configstore.ErrFolderHasHiddenPrompts) {
+			SendError(ctx, fasthttp.StatusConflict, err.Error())
 			return
 		}
 		logger.Error("failed to delete folder: %v", err)
@@ -324,7 +347,9 @@ func (h *PromptsHandler) deleteFolder(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	h.reloadCache(ctx)
+	if !h.refreshPrompts(ctx, "Folder", "deleted", promptIDs, true) {
+		return
+	}
 	name := id
 	if existing != nil {
 		name = existing.Name
@@ -428,7 +453,9 @@ func (h *PromptsHandler) createPrompt(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	h.reloadCache(ctx)
+	if !h.refreshPrompts(ctx, "Prompt", "created", []string{prompt.ID}, false) {
+		return
+	}
 	lib.RecordAuditChange(ctx, "prompt.created", "prompt", prompt.ID, prompt.Name, nil, auditPrompt(prompt))
 	SendJSON(ctx, map[string]any{
 		"prompt": prompt,
@@ -504,7 +531,9 @@ func (h *PromptsHandler) updatePrompt(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	h.reloadCache(ctx)
+	if !h.refreshPrompts(ctx, "Prompt", "updated", []string{prompt.ID}, false) {
+		return
+	}
 	lib.RecordAuditChange(ctx, "prompt.updated", "prompt", prompt.ID, prompt.Name, before, auditPrompt(prompt))
 	SendJSON(ctx, map[string]any{
 		"prompt": prompt,
@@ -535,7 +564,9 @@ func (h *PromptsHandler) deletePrompt(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	h.reloadCache(ctx)
+	if !h.refreshPrompts(ctx, "Prompt", "deleted", []string{id}, true) {
+		return
+	}
 	name := id
 	if existing != nil {
 		name = existing.Name
@@ -678,7 +709,9 @@ func (h *PromptsHandler) createVersion(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	h.reloadCache(ctx)
+	if !h.refreshPrompts(ctx, "Prompt version", "created", []string{version.PromptID}, false) {
+		return
+	}
 	lib.RecordAuditChange(ctx, "prompt_version.created", "prompt_version", strconv.FormatUint(uint64(version.ID), 10), promptVersionAuditName(prompt.Name, version), nil, auditPromptVersion(version))
 	SendJSON(ctx, map[string]any{
 		"version": version,
@@ -703,7 +736,17 @@ func (h *PromptsHandler) deleteVersion(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	existing, _ := h.store.GetPromptVersionByID(ctx, uint(id))
+	// The version is read first: its prompt is what the refresh after the delete re-reads.
+	existing, err := h.store.GetPromptVersionByID(ctx, uint(id))
+	if errors.Is(err, configstore.ErrNotFound) {
+		SendError(ctx, fasthttp.StatusNotFound, "version not found")
+		return
+	}
+	if err != nil {
+		logger.Error("failed to read version %d: %v", id, err)
+		SendError(ctx, fasthttp.StatusInternalServerError, err.Error())
+		return
+	}
 	if err := h.store.DeletePromptVersion(ctx, uint(id)); err != nil {
 		if errors.Is(err, configstore.ErrNotFound) {
 			SendError(ctx, fasthttp.StatusNotFound, "version not found")
@@ -714,7 +757,9 @@ func (h *PromptsHandler) deleteVersion(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	h.reloadCache(ctx)
+	if !h.refreshPrompts(ctx, "Prompt version", "deleted", []string{existing.PromptID}, false) {
+		return
+	}
 	name := idStr
 	if existing != nil {
 		promptName := existing.PromptID
@@ -894,7 +939,9 @@ func (h *PromptsHandler) createSession(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	h.reloadCache(ctx)
+	if !h.refreshPrompts(ctx, "Prompt session", "created", nil, false) {
+		return
+	}
 	lib.RecordAuditChange(ctx, "prompt_session.created", "prompt_session", strconv.FormatUint(uint64(session.ID), 10), promptSessionAuditName(session), nil, auditPromptSession(session))
 
 	SendJSON(ctx, map[string]any{
@@ -964,7 +1011,9 @@ func (h *PromptsHandler) updateSession(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	h.reloadCache(ctx)
+	if !h.refreshPrompts(ctx, "Prompt session", "updated", nil, false) {
+		return
+	}
 	lib.RecordAuditChange(ctx, "prompt_session.updated", "prompt_session", idStr, promptSessionAuditName(session), before, auditPromptSession(session))
 
 	SendJSON(ctx, map[string]any{
@@ -1001,7 +1050,9 @@ func (h *PromptsHandler) deleteSession(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	h.reloadCache(ctx)
+	if !h.refreshPrompts(ctx, "Prompt session", "deleted", nil, false) {
+		return
+	}
 
 	name := idStr
 	if existing != nil {
@@ -1054,7 +1105,9 @@ func (h *PromptsHandler) renameSession(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	h.reloadCache(ctx)
+	if !h.refreshPrompts(ctx, "Prompt session", "renamed", nil, false) {
+		return
+	}
 
 	before := auditPromptSession(session)
 	session.Name = req.Name
@@ -1163,7 +1216,9 @@ func (h *PromptsHandler) commitSession(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	h.reloadCache(ctx)
+	if !h.refreshPrompts(ctx, "Prompt version", "committed", []string{version.PromptID}, false) {
+		return
+	}
 	lib.RecordAuditChange(ctx, "prompt_session.committed", "prompt_session", idStr, promptSessionAuditName(session), nil, map[string]any{
 		"session_id":     session.ID,
 		"prompt_id":      session.PromptID,
